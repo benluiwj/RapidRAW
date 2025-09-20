@@ -42,7 +42,6 @@ import RightPanelSwitcher from './components/panel/right/RightPanelSwitcher';
 import MetadataPanel from './components/panel/right/MetadataPanel';
 import CropPanel from './components/panel/right/CropPanel';
 import PresetsPanel from './components/panel/right/PresetsPanel';
-import AIPanel from './components/panel/right/AIPanel';
 import ExportPanel from './components/panel/right/ExportPanel';
 import LibraryExportPanel from './components/panel/right/LibraryExportPanel';
 import MasksPanel from './components/panel/right/MasksPanel';
@@ -2260,56 +2259,56 @@ function App() {
 
   useEffect(() => {
     if (selectedImage && !selectedImage.isReady && selectedImage.path) {
-    let isEffectActive = true;
-    const loadFullImageData = async () => {
+      let isEffectActive = true;
+      const loadFullImageData = async () => {
         try {
-        const loadImageResult: any = await invoke(Invokes.LoadImage, { path: selectedImage.path });
-        if (!isEffectActive) {
+          const loadImageResult: any = await invoke(Invokes.LoadImage, { path: selectedImage.path });
+          if (!isEffectActive) {
             return;
-        }
-        const histData: any = await invoke(Invokes.GenerateHistogram);
-        if (!isEffectActive) {
+          }
+          const histData: any = await invoke(Invokes.GenerateHistogram);
+          if (!isEffectActive) {
             return;
-        }
+          }
 
-        // --- START OF ADDED/MOVED LOGIC ---
+          // --- START OF ADDED/MOVED LOGIC ---
 
-        const { width, height } = loadImageResult;
+          const { width, height } = loadImageResult;
 
-        // 1. Set originalSize directly from the loaded data
-        setOriginalSize({ width, height });
+          // 1. Set originalSize directly from the loaded data
+          setOriginalSize({ width, height });
 
-        // 2. Calculate and set previewSize
-        if (appSettings?.editorPreviewResolution) {
+          // 2. Calculate and set previewSize
+          if (appSettings?.editorPreviewResolution) {
             const maxSize = appSettings.editorPreviewResolution;
             const aspectRatio = width / height;
 
             if (width > height) {
-            const pWidth = Math.min(width, maxSize);
-            const pHeight = Math.round(pWidth / aspectRatio);
-            setPreviewSize({ width: pWidth, height: pHeight });
+              const pWidth = Math.min(width, maxSize);
+              const pHeight = Math.round(pWidth / aspectRatio);
+              setPreviewSize({ width: pWidth, height: pHeight });
             } else {
-            const pHeight = Math.min(height, maxSize);
-            const pWidth = Math.round(pHeight * aspectRatio);
-            setPreviewSize({ width: pWidth, height: pHeight });
+              const pHeight = Math.min(height, maxSize);
+              const pWidth = Math.round(pHeight * aspectRatio);
+              setPreviewSize({ width: pWidth, height: pHeight });
             }
-        } else {
+          } else {
             setPreviewSize({ width: 0, height: 0 });
-        }
+          }
 
-        // 3. Reset full resolution state
-        setIsFullResolution(false);
-        setFullResolutionUrl(null);
-        fullResCacheKeyRef.current = null;
+          // 3. Reset full resolution state
+          setIsFullResolution(false);
+          setFullResolutionUrl(null);
+          fullResCacheKeyRef.current = null;
 
-        // --- END OF ADDED/MOVED LOGIC ---
+          // --- END OF ADDED/MOVED LOGIC ---
 
-        const blob = new Blob([loadImageResult.original_image_bytes], { type: 'image/jpeg' });
-        const originalUrl = URL.createObjectURL(blob);
+          const blob = new Blob([loadImageResult.original_image_bytes], { type: 'image/jpeg' });
+          const originalUrl = URL.createObjectURL(blob);
 
-        setSelectedImage((currentSelected: SelectedImage | null) => {
+          setSelectedImage((currentSelected: SelectedImage | null) => {
             if (currentSelected && currentSelected.path === selectedImage.path) {
-            return {
+              return {
                 ...currentSelected,
                 exif: loadImageResult.exif,
                 height: loadImageResult.height,
@@ -2318,42 +2317,42 @@ function App() {
                 metadata: loadImageResult.metadata,
                 originalUrl: originalUrl,
                 width: loadImageResult.width,
-            };
+              };
             }
             return currentSelected;
-        });
+          });
 
-        let initialAdjusts;
-        if (loadImageResult.metadata.adjustments && !loadImageResult.metadata.adjustments.is_null) {
+          let initialAdjusts;
+          if (loadImageResult.metadata.adjustments && !loadImageResult.metadata.adjustments.is_null) {
             initialAdjusts = normalizeLoadedAdjustments(loadImageResult.metadata.adjustments);
-        } else {
+          } else {
             initialAdjusts = {
-            ...INITIAL_ADJUSTMENTS,
-            aspectRatio: loadImageResult.width / loadImageResult.height,
+              ...INITIAL_ADJUSTMENTS,
+              aspectRatio: loadImageResult.width / loadImageResult.height,
             };
-        }
-        if (loadImageResult.metadata.adjustments && !loadImageResult.metadata.adjustments.is_null) {
+          }
+          if (loadImageResult.metadata.adjustments && !loadImageResult.metadata.adjustments.is_null) {
             initialAdjusts = normalizeLoadedAdjustments(loadImageResult.metadata.adjustments);
-        }
-        setLiveAdjustments(initialAdjusts);
-        resetAdjustmentsHistory(initialAdjusts);
-        setHistogram(histData);
+          }
+          setLiveAdjustments(initialAdjusts);
+          resetAdjustmentsHistory(initialAdjusts);
+          setHistogram(histData);
         } catch (err) {
-        if (isEffectActive) {
+          if (isEffectActive) {
             console.error('Failed to load image:', err);
             setError(`Failed to load image: ${err}`);
             setSelectedImage(null);
-        }
+          }
         } finally {
-        if (isEffectActive) {
+          if (isEffectActive) {
             setIsViewLoading(false);
+          }
         }
-        }
-    };
-    loadFullImageData();
-    return () => {
+      };
+      loadFullImageData();
+      return () => {
         isEffectActive = false;
-    };
+      };
     }
   }, [selectedImage?.path, selectedImage?.isReady, resetAdjustmentsHistory, appSettings?.editorPreviewResolution]);
 
@@ -2452,7 +2451,14 @@ function App() {
           setError(`Failed to reset adjustments: ${err}`);
         });
     },
-    [multiSelectedPaths, libraryActivePath, selectedImage, adjustments.rating, resetAdjustmentsHistory, debouncedSetHistory],
+    [
+      multiSelectedPaths,
+      libraryActivePath,
+      selectedImage,
+      adjustments.rating,
+      resetAdjustmentsHistory,
+      debouncedSetHistory,
+    ],
   );
 
   const handleImportClick = useCallback(
@@ -3379,7 +3385,9 @@ function App() {
       />
       <CullingModal
         isOpen={cullingModalState.isOpen}
-        onClose={() => setCullingModalState({ isOpen: false, progress: null, suggestions: null, error: null, pathsToCull: [] })}
+        onClose={() =>
+          setCullingModalState({ isOpen: false, progress: null, suggestions: null, error: null, pathsToCull: [] })
+        }
         progress={cullingModalState.progress}
         suggestions={cullingModalState.suggestions}
         error={cullingModalState.error}

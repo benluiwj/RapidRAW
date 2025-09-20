@@ -1,58 +1,46 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod ai_processing;
 mod culling;
-mod comfyui_connector;
 mod file_management;
 mod formats;
 mod gpu_processing;
 mod image_loader;
 mod image_processing;
-mod inpainting;
 mod lut_processing;
 mod mask_generation;
 mod panorama_stitching;
 mod panorama_utils;
 mod raw_processing;
 mod tagging;
-mod tagging_utils;
 
-use std::thread;
 use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io::Cursor;
+use std::io::{Cursor, Write};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
 
 use base64::{Engine as _, engine::general_purpose};
 use chrono::{DateTime, Utc};
 use image::codecs::jpeg::JpegEncoder;
 use image::{
-    DynamicImage, GenericImageView, GrayImage, ImageBuffer, ImageFormat, Luma, Rgb, RgbImage, Rgba,
-    RgbaImage,
+    DynamicImage, GenericImageView, ImageBuffer, ImageFormat, Luma, RgbImage, Rgba, RgbaImage,
 };
 use little_exif::exif_tag::ExifTag;
 use little_exif::filetype::FileExtension;
 use little_exif::metadata::Metadata;
 use little_exif::rational::uR64;
+use reqwest;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Mutex;
 use tauri::{Emitter, Manager, ipc::Response};
-use tokio::sync::Mutex as TokioMutex;
-use tokio::task::JoinHandle;
 use tempfile::NamedTempFile;
-use reqwest;
-use std::io::Write;
+use tokio::task::JoinHandle;
 use wgpu::{Texture, TextureView};
 
-use crate::ai_processing::{
-    AiForegroundMaskParameters, AiSkyMaskParameters, AiState, AiSubjectMaskParameters,
-    generate_image_embeddings, get_or_init_ai_models, run_sam_decoder, run_sky_seg_model,
-    run_u2netp_model,
-};
 use crate::file_management::{AppSettings, get_sidecar_path, load_settings};
 use crate::formats::is_raw_file;
 use crate::image_loader::{
@@ -63,8 +51,7 @@ use crate::image_processing::{
     get_all_adjustments_from_json, get_or_init_gpu_context, process_and_get_dynamic_image,
 };
 use crate::lut_processing::Lut;
-use crate::mask_generation::{AiPatchDefinition, MaskDefinition, generate_mask_bitmap};
-use tagging_utils::{candidates, hierarchy};
+use crate::mask_generation::{MaskDefinition, generate_mask_bitmap};
 
 #[derive(Clone)]
 pub struct LoadedImage {
@@ -95,8 +82,6 @@ pub struct AppState {
     cached_preview: Mutex<Option<CachedPreview>>,
     gpu_context: Mutex<Option<GpuContext>>,
     gpu_image_cache: Mutex<Option<GpuImageCache>>,
-    ai_state: Mutex<Option<AiState>>,
-    ai_init_lock: TokioMutex<()>,
     export_task_handle: Mutex<Option<JoinHandle<()>>>,
     panorama_result: Arc<Mutex<Option<RgbImage>>>,
     indexing_task_handle: Mutex<Option<JoinHandle<()>>>,
@@ -309,15 +294,6 @@ fn generate_transformed_preview(
         apply_all_transformations(&processing_base, adjustments, scale_for_gpu);
 
     Ok((final_preview_base, scale_for_gpu, unscaled_crop_offset))
-}
-
-fn encode_to_base64_png(image: &GrayImage) -> Result<String, String> {
-    let mut buf = Cursor::new(Vec::new());
-    image
-        .write_to(&mut buf, ImageFormat::Png)
-        .map_err(|e| e.to_string())?;
-    let base64_str = general_purpose::STANDARD.encode(buf.get_ref());
-    Ok(format!("data:image/png;base64,{}", base64_str))
 }
 
 fn read_exif_data(file_bytes: &[u8]) -> HashMap<String, String> {
@@ -672,7 +648,14 @@ fn generate_fullscreen_preview(
 ) -> Result<Response, String> {
     let context = get_or_init_gpu_context(&state)?;
     let original_image = get_full_image_for_processing(&state)?;
-    let path = state.original_image.lock().unwrap().as_ref().ok_or("Original image path not found")?.path.clone();
+    let path = state
+        .original_image
+        .lock()
+        .unwrap()
+        .as_ref()
+        .ok_or("Original image path not found")?
+        .path
+        .clone();
     let unique_hash = calculate_full_job_hash(&path, &js_adjustments);
     let base_image = composite_patches_on_image(&original_image, &js_adjustments)
         .map_err(|e| format!("Failed to composite AI patches for fullscreen: {}", e))?;
@@ -1070,7 +1053,14 @@ async fn estimate_export_size(
 ) -> Result<usize, String> {
     let context = get_or_init_gpu_context(&state)?;
     let original_image_data = get_full_image_for_processing(&state)?;
-    let path = state.original_image.lock().unwrap().as_ref().ok_or("Original image path not found")?.path.clone();
+    let path = state
+        .original_image
+        .lock()
+        .unwrap()
+        .as_ref()
+        .ok_or("Original image path not found")?
+        .path
+        .clone();
 
     let base_image = composite_patches_on_image(&original_image_data, &js_adjustments)
         .map_err(|e| format!("Failed to composite AI patches for estimation: {}", e))?;
@@ -1260,200 +1250,6 @@ fn generate_mask_overlay(
 }
 
 #[tauri::command]
-async fn generate_ai_foreground_mask(
-    rotation: f32,
-    flip_horizontal: bool,
-    flip_vertical: bool,
-    orientation_steps: u8,
-    state: tauri::State<'_, AppState>,
-    app_handle: tauri::AppHandle,
-) -> Result<AiForegroundMaskParameters, String> {
-    let models = get_or_init_ai_models(&app_handle, &state.ai_state, &state.ai_init_lock)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let full_image = get_full_image_for_processing(&state)?;
-    let full_mask_image =
-        run_u2netp_model(&full_image, &models.u2netp).map_err(|e| e.to_string())?;
-    let base64_data = encode_to_base64_png(&full_mask_image)?;
-
-    Ok(AiForegroundMaskParameters {
-        mask_data_base64: Some(base64_data),
-        rotation: Some(rotation),
-        flip_horizontal: Some(flip_horizontal),
-        flip_vertical: Some(flip_vertical),
-        orientation_steps: Some(orientation_steps),
-    })
-}
-
-#[tauri::command]
-async fn generate_ai_sky_mask(
-    rotation: f32,
-    flip_horizontal: bool,
-    flip_vertical: bool,
-    orientation_steps: u8,
-    state: tauri::State<'_, AppState>,
-    app_handle: tauri::AppHandle,
-) -> Result<AiSkyMaskParameters, String> {
-    let models = get_or_init_ai_models(&app_handle, &state.ai_state, &state.ai_init_lock)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let full_image = get_full_image_for_processing(&state)?;
-    let full_mask_image =
-        run_sky_seg_model(&full_image, &models.sky_seg).map_err(|e| e.to_string())?;
-    let base64_data = encode_to_base64_png(&full_mask_image)?;
-
-    Ok(AiSkyMaskParameters {
-        mask_data_base64: Some(base64_data),
-        rotation: Some(rotation),
-        flip_horizontal: Some(flip_horizontal),
-        flip_vertical: Some(flip_vertical),
-        orientation_steps: Some(orientation_steps),
-    })
-}
-
-#[tauri::command]
-async fn generate_ai_subject_mask(
-    path: String,
-    start_point: (f64, f64),
-    end_point: (f64, f64),
-    rotation: f32,
-    flip_horizontal: bool,
-    flip_vertical: bool,
-    orientation_steps: u8,
-    state: tauri::State<'_, AppState>,
-    app_handle: tauri::AppHandle,
-) -> Result<AiSubjectMaskParameters, String> {
-    let models = get_or_init_ai_models(&app_handle, &state.ai_state, &state.ai_init_lock)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let embeddings = {
-        let mut ai_state_lock = state.ai_state.lock().unwrap();
-        let ai_state = ai_state_lock.as_mut().unwrap();
-
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(path.as_bytes());
-        let path_hash = hasher.finalize().to_hex().to_string();
-
-        if let Some(cached_embeddings) = &ai_state.embeddings {
-            if cached_embeddings.path_hash == path_hash {
-                cached_embeddings.clone()
-            } else {
-                let full_image = get_full_image_for_processing(&state)?;
-                let mut new_embeddings =
-                    generate_image_embeddings(&full_image, &models.sam_encoder)
-                        .map_err(|e| e.to_string())?;
-                new_embeddings.path_hash = path_hash;
-                ai_state.embeddings = Some(new_embeddings.clone());
-                new_embeddings
-            }
-        } else {
-            let full_image = get_full_image_for_processing(&state)?;
-            let mut new_embeddings = generate_image_embeddings(&full_image, &models.sam_encoder)
-                .map_err(|e| e.to_string())?;
-            new_embeddings.path_hash = path_hash;
-            ai_state.embeddings = Some(new_embeddings.clone());
-            new_embeddings
-        }
-    };
-
-    let (img_w, img_h) = embeddings.original_size;
-
-    let (coarse_rotated_w, coarse_rotated_h) = if orientation_steps % 2 == 1 {
-        (img_h as f64, img_w as f64)
-    } else {
-        (img_w as f64, img_h as f64)
-    };
-
-    let center = (coarse_rotated_w / 2.0, coarse_rotated_h / 2.0);
-
-    let p1 = start_point;
-    let p2 = (start_point.0, end_point.1);
-    let p3 = end_point;
-    let p4 = (end_point.0, start_point.1);
-
-    let angle_rad = (rotation as f64).to_radians();
-    let cos_a = angle_rad.cos();
-    let sin_a = angle_rad.sin();
-
-    let unrotate = |p: (f64, f64)| {
-        let px = p.0 - center.0;
-        let py = p.1 - center.1;
-        let new_px = px * cos_a + py * sin_a + center.0;
-        let new_py = -px * sin_a + py * cos_a + center.1;
-        (new_px, new_py)
-    };
-
-    let up1 = unrotate(p1);
-    let up2 = unrotate(p2);
-    let up3 = unrotate(p3);
-    let up4 = unrotate(p4);
-
-    let unflip = |p: (f64, f64)| {
-        let mut new_px = p.0;
-        let mut new_py = p.1;
-        if flip_horizontal {
-            new_px = coarse_rotated_w - p.0;
-        }
-        if flip_vertical {
-            new_py = coarse_rotated_h - p.1;
-        }
-        (new_px, new_py)
-    };
-
-    let ufp1 = unflip(up1);
-    let ufp2 = unflip(up2);
-    let ufp3 = unflip(up3);
-    let ufp4 = unflip(up4);
-
-    let un_coarse_rotate = |p: (f64, f64)| -> (f64, f64) {
-        match orientation_steps {
-            0 => p,
-            1 => (p.1, img_h as f64 - p.0),
-            2 => (img_w as f64 - p.0, img_h as f64 - p.1),
-            3 => (img_w as f64 - p.1, p.0),
-            _ => p,
-        }
-    };
-
-    let ucrp1 = un_coarse_rotate(ufp1);
-    let ucrp2 = un_coarse_rotate(ufp2);
-    let ucrp3 = un_coarse_rotate(ufp3);
-    let ucrp4 = un_coarse_rotate(ufp4);
-
-    let min_x = ucrp1.0.min(ucrp2.0).min(ucrp3.0).min(ucrp4.0);
-    let min_y = ucrp1.1.min(ucrp2.1).min(ucrp3.1).min(ucrp4.1);
-    let max_x = ucrp1.0.max(ucrp2.0).max(ucrp3.0).max(ucrp4.0);
-    let max_y = ucrp1.1.max(ucrp2.1).max(ucrp3.1).max(ucrp4.1);
-
-    let unrotated_start_point = (min_x, min_y);
-    let unrotated_end_point = (max_x, max_y);
-
-    let mask_bitmap = run_sam_decoder(
-        &models.sam_decoder,
-        &embeddings,
-        unrotated_start_point,
-        unrotated_end_point,
-    )
-    .map_err(|e| e.to_string())?;
-    let base64_data = encode_to_base64_png(&mask_bitmap)?;
-
-    Ok(AiSubjectMaskParameters {
-        start_x: start_point.0,
-        start_y: start_point.1,
-        end_x: end_point.0,
-        end_y: end_point.1,
-        mask_data_base64: Some(base64_data),
-        rotation: Some(rotation),
-        flip_horizontal: Some(flip_horizontal),
-        flip_vertical: Some(flip_vertical),
-        orientation_steps: Some(orientation_steps),
-    })
-}
-
-#[tauri::command]
 fn generate_preset_preview(
     js_adjustments: serde_json::Value,
     state: tauri::State<AppState>,
@@ -1513,187 +1309,6 @@ fn generate_preset_preview(
 #[tauri::command]
 fn update_window_effect(theme: String, window: tauri::Window) {
     apply_window_effect(theme, window);
-}
-
-#[tauri::command]
-async fn check_comfyui_status(app_handle: tauri::AppHandle) {
-    let settings = load_settings(app_handle.clone()).unwrap_or_default();
-    let is_connected = if let Some(address) = settings.comfyui_address {
-        comfyui_connector::ping_server(&address).await.is_ok()
-    } else {
-        false
-    };
-    let _ = app_handle.emit(
-        "comfyui-status-update",
-        serde_json::json!({ "connected": is_connected }),
-    );
-}
-
-#[tauri::command]
-async fn test_comfyui_connection(address: String) -> Result<(), String> {
-    comfyui_connector::ping_server(&address)
-        .await
-        .map_err(|e| e.to_string())
-}
-
-fn calculate_dynamic_patch_radius(width: u32, height: u32) -> u32 {
-    const MIN_RADIUS: u32 = 2;
-    const MAX_RADIUS: u32 = 32;
-    const BASE_DIMENSION: f32 = 192.0;
-
-    let min_dim = width.min(height) as f32;
-    let scaled_radius = (min_dim / BASE_DIMENSION).round() as u32;
-    scaled_radius.clamp(MIN_RADIUS, MAX_RADIUS)
-}
-
-#[tauri::command]
-async fn invoke_generative_replace_with_mask_def(
-    _path: String,
-    patch_definition: AiPatchDefinition,
-    current_adjustments: Value,
-    use_fast_inpaint: bool,
-    token: Option<String>, // reserved parameter for future authentication, when the optional generative cloud service releases
-    app_handle: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
-) -> Result<String, String> {
-    let settings = load_settings(app_handle.clone()).unwrap_or_default();
-
-    let mut source_image_adjustments = current_adjustments.clone();
-    if let Some(patches) = source_image_adjustments
-        .get_mut("aiPatches")
-        .and_then(|v| v.as_array_mut())
-    {
-        patches.retain(|p| p.get("id").and_then(|id| id.as_str()) != Some(&patch_definition.id));
-    }
-
-    let base_image = get_full_image_for_processing(&state)?;
-    let source_image = composite_patches_on_image(&base_image, &source_image_adjustments)
-        .map_err(|e| format!("Failed to prepare source image: {}", e))?;
-
-    let (img_w, img_h) = source_image.dimensions();
-    let mask_def_for_generation = MaskDefinition {
-        id: patch_definition.id.clone(),
-        name: patch_definition.name.clone(),
-        visible: patch_definition.visible,
-        invert: patch_definition.invert,
-        opacity: 100.0,
-        adjustments: serde_json::Value::Null,
-        sub_masks: patch_definition.sub_masks,
-    };
-
-    let mask_bitmap = generate_mask_bitmap(&mask_def_for_generation, img_w, img_h, 1.0, (0.0, 0.0))
-        .ok_or("Failed to generate mask bitmap for AI replace")?;
-
-    let patch_rgba = if use_fast_inpaint { // cpu based inpainting, low quality but no setup required
-        let patch_radius = calculate_dynamic_patch_radius(img_w, img_h);
-        inpainting::perform_fast_inpaint(&source_image, &mask_bitmap, patch_radius)?
-    } else if let Some(address) = settings.comfyui_address { // self hosted generative ai service
-        let comfy_config = settings.comfyui_workflow_config;
-
-        let mut rgba_mask = RgbaImage::new(img_w, img_h);
-        for (x, y, luma_pixel) in mask_bitmap.enumerate_pixels() {
-            let intensity = luma_pixel[0];
-            rgba_mask.put_pixel(x, y, Rgba([0, 0, 0, intensity]));
-        }
-        let mask_image = DynamicImage::ImageRgba8(rgba_mask);
-
-        let result_png_bytes = comfyui_connector::execute_workflow(
-            &address,
-            &comfy_config,
-            source_image,
-            Some(mask_image),
-            Some(patch_definition.prompt),
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-
-        image::load_from_memory(&result_png_bytes)
-            .map_err(|e| e.to_string())?
-            .to_rgba8()
-    } else if let Some(auth_token) = token { // convenience cloud service
-        let client = reqwest::Client::new();
-        let api_url = "https://api.letshopeitcompiles.com/inpaint"; // endpoint not yet built
-
-        let mut source_buf = Cursor::new(Vec::new());
-        source_image.write_to(&mut source_buf, ImageFormat::Png).map_err(|e| e.to_string())?;
-        let source_base64 = general_purpose::STANDARD.encode(source_buf.get_ref());
-
-        let mut mask_buf = Cursor::new(Vec::new());
-        mask_bitmap.write_to(&mut mask_buf, ImageFormat::Png).map_err(|e| e.to_string())?;
-        let mask_base64 = general_purpose::STANDARD.encode(mask_buf.get_ref());
-
-        let request_body = serde_json::json!({
-            "prompt": patch_definition.prompt,
-            "image": source_base64,
-            "mask": mask_base64,
-        });
-
-        let response = client
-            .post(api_url)
-            .header("Authorization", format!("Bearer {}", auth_token))
-            .json(&request_body)
-            .send()
-            .await
-            .map_err(|e| format!("Failed to send request to cloud service: {}", e))?;
-
-        if response.status().is_success() {
-            let response_bytes = response.bytes().await.map_err(|e| e.to_string())?;
-            image::load_from_memory(&response_bytes)
-                .map_err(|e| format!("Failed to decode cloud service response: {}", e))?
-                .to_rgba8()
-        } else {
-            let status = response.status();
-            let error_body = response.text().await.unwrap_or_else(|_| "Could not read error body".to_string());
-            return Err(format!("Cloud service returned an error ({}): {}", status, error_body));
-        }
-    } else {
-        return Err("No generative backend available. Connect to ComfyUI or upgrade to Pro for Cloud AI.".to_string());
-    };
-
-    let (patch_w, patch_h) = patch_rgba.dimensions();
-    let scaled_mask_bitmap = image::imageops::resize(
-        &mask_bitmap,
-        patch_w,
-        patch_h,
-        image::imageops::FilterType::Lanczos3,
-    );
-    let mut color_image = RgbImage::new(patch_w, patch_h);
-    let mask_image = scaled_mask_bitmap.clone();
-
-    for y in 0..patch_h {
-        for x in 0..patch_w {
-            let mask_value = scaled_mask_bitmap.get_pixel(x, y)[0];
-
-            if mask_value > 0 {
-                let patch_pixel = patch_rgba.get_pixel(x, y);
-                color_image.put_pixel(x, y, Rgb([patch_pixel[0], patch_pixel[1], patch_pixel[2]]));
-            } else {
-                color_image.put_pixel(x, y, Rgb([0, 0, 0]));
-            }
-        }
-    }
-
-    let quality = 92;
-
-    let mut color_buf = Cursor::new(Vec::new());
-    color_image
-        .write_with_encoder(JpegEncoder::new_with_quality(&mut color_buf, quality))
-        .map_err(|e| e.to_string())?;
-    let color_base64 = general_purpose::STANDARD.encode(color_buf.get_ref());
-
-    let mut mask_buf = Cursor::new(Vec::new());
-    mask_image
-        .write_with_encoder(JpegEncoder::new_with_quality(&mut mask_buf, quality))
-        .map_err(|e| e.to_string())?;
-    let mask_base64 = general_purpose::STANDARD.encode(mask_buf.get_ref());
-
-    let result_json = serde_json::json!({
-        "color": color_base64,
-        "mask": mask_base64
-    })
-    .to_string();
-
-    Ok(result_json)
 }
 
 #[tauri::command]
@@ -1779,8 +1394,9 @@ async fn stitch_panorama(
 async fn fetch_community_presets() -> Result<Vec<CommunityPreset>, String> {
     let client = reqwest::Client::new();
     let url = "https://raw.githubusercontent.com/CyberTimon/RapidRAW-Presets/main/manifest.json";
-    
-    let response = client.get(url)
+
+    let response = client
+        .get(url)
         .header("User-Agent", "RapidRAW-App")
         .send()
         .await
@@ -1790,7 +1406,9 @@ async fn fetch_community_presets() -> Result<Vec<CommunityPreset>, String> {
         return Err(format!("GitHub returned an error: {}", response.status()));
     }
 
-    let presets: Vec<CommunityPreset> = response.json().await
+    let presets: Vec<CommunityPreset> = response
+        .json()
+        .await
         .map_err(|e| format!("Failed to parse manifest.json: {}", e))?;
 
     Ok(presets)
@@ -1837,7 +1455,9 @@ async fn generate_all_community_previews(
 
             let mask_bitmaps: Vec<ImageBuffer<Luma<u8>, Vec<u8>>> = mask_definitions
                 .iter()
-                .filter_map(|def| generate_mask_bitmap(def, img_w, img_h, 1.0, unscaled_crop_offset))
+                .filter_map(|def| {
+                    generate_mask_bitmap(def, img_w, img_h, 1.0, unscaled_crop_offset)
+                })
                 .collect();
 
             let all_adjustments = get_all_adjustments_from_json(&js_adjustments);
@@ -1855,7 +1475,7 @@ async fn generate_all_community_previews(
                 &mask_bitmaps,
                 lut,
             )?;
-            
+
             let processed_image = processed_image_dynamic.to_rgb8();
 
             let (proc_w, proc_h) = processed_image.dimensions();
@@ -2068,8 +1688,6 @@ fn main() {
             cached_preview: Mutex::new(None),
             gpu_context: Mutex::new(None),
             gpu_image_cache: Mutex::new(None),
-            ai_state: Mutex::new(None),
-            ai_init_lock: TokioMutex::new(()),
             export_task_handle: Mutex::new(None),
             panorama_result: Arc::new(Mutex::new(None)),
             indexing_task_handle: Mutex::new(None),
@@ -2089,13 +1707,7 @@ fn main() {
             generate_preset_preview,
             generate_uncropped_preview,
             generate_mask_overlay,
-            generate_ai_subject_mask,
-            generate_ai_foreground_mask,
-            generate_ai_sky_mask,
             update_window_effect,
-            check_comfyui_status,
-            test_comfyui_connection,
-            invoke_generative_replace_with_mask_def,
             get_supported_file_types,
             stitch_panorama,
             save_panorama,

@@ -18,7 +18,6 @@ const panelOptions: Array<PanelOptions> = [
   { id: Panel.Crop, icon: Scaling, title: 'Crop' },
   { id: Panel.Masks, icon: Layers, title: 'Masks' },
   { id: Panel.Presets, icon: Bookmark, title: 'Presets' },
-  { id: Panel.Ai, icon: BrainCircuit, title: 'AI Tools' },
   { id: Panel.Export, icon: Save, title: 'Export' },
 ];
 
